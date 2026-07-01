@@ -1,0 +1,241 @@
+:root {
+  --led: #ffffff;
+  --glow: rgba(255, 255, 255, 0.85);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #000;
+  color: #fff;
+  font-family: "Helvetica Neue", Arial, "Segoe UI", system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: none; /* let multitouch drive the mallets, not scroll/zoom */
+  overscroll-behavior: none;
+}
+
+#stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+}
+
+/* Webcam fills the screen, mirrored like a mirror. */
+#cam {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1);
+  filter: brightness(0.92) saturate(1.05);
+  background: #050505;
+  z-index: 0;
+  transition: filter 0.3s ease, opacity 0.3s ease;
+}
+
+/* Background modes (cycled by the BG button / "B" key). */
+body.bg-blur #cam {
+  /* scale a touch to hide the soft edges the blur creates */
+  transform: scaleX(-1) scale(1.08);
+  filter: blur(24px) brightness(0.6) saturate(1.05);
+}
+
+body.bg-black #cam {
+  opacity: 0; /* the black page shows through */
+}
+
+/* Game vector layer (rink lines, mallets, puck). */
+#game {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+}
+
+/* LED scoreboard, top-center. */
+#scoreboard {
+  position: absolute;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Center message (GOAL / countdown / winner). */
+#message {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  font-weight: 800;
+  font-size: clamp(48px, 12vw, 160px);
+  letter-spacing: 0.06em;
+  color: #fff;
+  text-shadow: 0 0 12px var(--glow), 0 0 34px rgba(255, 255, 255, 0.55);
+  pointer-events: none;
+  white-space: nowrap;
+  text-align: center;
+}
+
+#message.small {
+  font-size: clamp(28px, 5vw, 64px);
+  letter-spacing: 0.12em;
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Start / status overlay. */
+.overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(0, 0, 0, 0.55),
+    rgba(0, 0, 0, 0.9)
+  );
+  backdrop-filter: blur(6px);
+}
+
+.panel {
+  text-align: center;
+  padding: 40px;
+  max-width: 90vw;
+}
+
+.panel h1 {
+  font-size: clamp(40px, 9vw, 92px);
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 0.95;
+  text-shadow: 0 0 18px var(--glow), 0 0 44px rgba(255, 255, 255, 0.4);
+}
+
+.panel h1 span {
+  display: block;
+  font-weight: 300;
+  letter-spacing: 0.42em;
+  font-size: 0.42em;
+  margin-top: 0.5em;
+  padding-left: 0.42em;
+  opacity: 0.85;
+}
+
+.tagline {
+  margin-top: 22px;
+  font-size: clamp(14px, 2.2vw, 20px);
+  font-weight: 300;
+  letter-spacing: 0.04em;
+  opacity: 0.8;
+}
+
+#startBtn {
+  margin-top: 34px;
+  padding: 16px 54px;
+  font-size: clamp(18px, 2.6vw, 26px);
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  color: #fff;
+  background: transparent;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  text-shadow: 0 0 10px var(--glow);
+  box-shadow: 0 0 18px rgba(255, 255, 255, 0.18),
+    inset 0 0 18px rgba(255, 255, 255, 0.08);
+}
+
+#startBtn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  box-shadow: 0 0 30px rgba(255, 255, 255, 0.4),
+    inset 0 0 22px rgba(255, 255, 255, 0.12);
+}
+
+#startBtn:active {
+  transform: scale(0.97);
+}
+
+.hint {
+  margin-top: 26px;
+  font-size: clamp(11px, 1.6vw, 14px);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0.55;
+}
+
+.status {
+  margin-top: 16px;
+  min-height: 1.2em;
+  font-size: 14px;
+  letter-spacing: 0.06em;
+  opacity: 0.9;
+  color: #ffd9d0;
+}
+
+/* Corner control button (background toggle). Sits below the start overlay
+   (z-index 5) so it's hidden on the menu and appears once play begins. */
+.ctrl-btn {
+  position: absolute;
+  top: 14px;
+  left: 14px;
+  z-index: 4;
+  padding: 9px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.85);
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 999px;
+  cursor: pointer;
+  pointer-events: auto;
+  backdrop-filter: blur(4px);
+  transition: all 0.15s ease;
+}
+
+.ctrl-btn:hover {
+  color: #fff;
+  border-color: rgba(255, 255, 255, 0.7);
+  box-shadow: 0 0 14px rgba(255, 255, 255, 0.2);
+}
+
+.ctrl-btn:active {
+  transform: scale(0.96);
+}
+
+/* Small persistent notice (e.g. mouse mode / controls). */
+#notice {
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 3;
+  font-size: 12px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+  text-shadow: 0 0 8px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+  text-align: center;
+  white-space: nowrap;
+}

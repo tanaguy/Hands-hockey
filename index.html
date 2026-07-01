@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Hand Hockey</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body class="bg-clear">
+    <div id="stage">
+      <video id="cam" playsinline muted autoplay></video>
+      <canvas id="game"></canvas>
+      <canvas id="scoreboard"></canvas>
+
+      <button id="bgBtn" class="ctrl-btn" type="button">BG · WEBCAM</button>
+      <div id="message" class="hidden"></div>
+      <div id="notice"></div>
+
+      <div id="overlay" class="overlay">
+        <div class="panel">
+          <h1>HAND<span>HOCKEY</span></h1>
+          <p class="tagline">Two players. Your hands are the mallets.</p>
+          <button id="startBtn">START</button>
+          <p class="hint">
+            Allow camera &bull; Player&nbsp;1 left &bull; Player&nbsp;2 right
+          </p>
+          <p id="status" class="status"></p>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
