@@ -10,7 +10,7 @@ import http.server
 import os
 import socketserver
 
-PORT = 5175
+PORT = 5176
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 Handler = http.server.SimpleHTTPRequestHandler

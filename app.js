@@ -1,15 +1,6 @@
-// Hand Hockey — webcam air-hockey where each player's hand is a mallet.
-// Native ES modules, no build step. MediaPipe HandLandmarker runs on the GPU.
-
-import {
-  HandLandmarker,
-  FilesetResolver,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
-
-const WASM_URL =
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const MODEL_URL =
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+// Hand Hockey (Web Worker edition) — webcam air-hockey where each player's hand
+// is a mallet. MediaPipe HandLandmarker runs in a Web Worker (vision.worker.js)
+// so hand inference never blocks the render thread. Native ES modules, no build.
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -24,6 +15,8 @@ const PADDLE_BOUNCE = 1.06; // mallet bounciness (slightly lively)
 const INPUT_LERP = 34; // mallet responsiveness (higher = snappier)
 const PUCK_DIAMETER_RATIO = 1 / 7; // puck diameter as a fraction of screen height
 const MALLET_TO_PUCK_RATIO = 3.8 / 2.5; // real-world mallet : puck diameter ratio
+const NUM_HANDS = 2; // one hand per player; keep low — detection cost scales with this
+const DETECT_INTERVAL_MS = 28; // cap hand tracking to ~30 Hz regardless of camera fps
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -47,11 +40,13 @@ let W = 0,
   H = 0,
   dpr = 1;
 let dim = {}; // derived sizes (radii, goal, speeds) recomputed on resize
-let handLandmarker = null;
+let worker = null;
+let workerReady = false;
+let workerBusy = false; // one frame in flight at a time → back-pressure
 let useCamera = true;
 let mouseMode = false;
 let lastVideoTime = -1;
-let detectTs = 0;
+let lastDetect = 0;
 
 let gameState = "menu"; // menu | countdown | playing | goal | over | paused
 let stateUntil = 0;
@@ -89,6 +84,7 @@ function resize() {
   computeDimensions();
   clampPlayer(players[0]);
   clampPlayer(players[1]);
+  buildRink();
   layoutScoreboard();
   drawScoreboard();
 }
@@ -157,7 +153,12 @@ async function initCamera() {
   const stream = await withTimeout(
     navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+      video: {
+        facingMode: "user",
+        width: { ideal: 960 },
+        height: { ideal: 540 },
+        frameRate: { ideal: 30, max: 30 },
+      },
     }),
     6000
   );
@@ -169,21 +170,37 @@ async function initCamera() {
   });
 }
 
-async function initHandLandmarker() {
-  const vision = await FilesetResolver.forVisionTasks(WASM_URL);
-  const opts = (delegate) => ({
-    baseOptions: { modelAssetPath: MODEL_URL, delegate },
-    numHands: 4, // leftmost drives P1, rightmost drives P2; extras ignored
-    runningMode: "VIDEO",
-    minHandDetectionConfidence: 0.5,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
+function initWorker() {
+  return new Promise((resolve, reject) => {
+    // Classic worker (not a module) — MediaPipe's loader needs importScripts().
+    worker = new Worker(new URL("./vision.worker.js", import.meta.url));
+    const timeout = setTimeout(
+      () => reject(new Error("hand-tracking worker timed out")),
+      20000
+    );
+    worker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === "ready") {
+        clearTimeout(timeout);
+        workerReady = true;
+        console.log(
+          "HandLandmarker ready in worker — " + msg.delegate + " delegate"
+        );
+        resolve();
+      } else if (msg.type === "error") {
+        clearTimeout(timeout);
+        reject(new Error(msg.error));
+      } else if (msg.type === "result") {
+        workerBusy = false;
+        onHands(msg.hands);
+      }
+    };
+    worker.onerror = (err) => {
+      clearTimeout(timeout);
+      reject(err && err.message ? new Error(err.message) : err);
+    };
+    worker.postMessage({ type: "init", numHands: NUM_HANDS });
   });
-  try {
-    handLandmarker = await HandLandmarker.createFromOptions(vision, opts("GPU"));
-  } catch (e) {
-    handLandmarker = await HandLandmarker.createFromOptions(vision, opts("CPU"));
-  }
 }
 
 // Map a landmark (normalised to the camera frame) to a screen pixel, taking
@@ -203,31 +220,36 @@ function mapToScreen(nx, ny) {
   return { x, y };
 }
 
-// Stable palm center: average of wrist + finger MCP joints.
-const PALM = [0, 5, 9, 13, 17];
-function palmPoint(lm) {
-  let sx = 0,
-    sy = 0;
-  for (const i of PALM) {
-    sx += lm[i].x;
-    sy += lm[i].y;
-  }
-  return mapToScreen(sx / PALM.length, sy / PALM.length);
+// Hand the current camera frame to the worker for detection. Back-pressure via
+// `workerBusy` means we never queue frames or block rendering — detection runs
+// as fast as the worker manages, and the render loop just keeps going at 60 fps.
+function sendFrame(now) {
+  if (!workerReady || workerBusy || !video.videoWidth) return;
+  if (now - lastDetect < DETECT_INTERVAL_MS) return; // cap tracking rate
+  if (video.currentTime === lastVideoTime) return; // skip already-seen frames
+  lastDetect = now;
+  lastVideoTime = video.currentTime;
+  workerBusy = true;
+  createImageBitmap(video)
+    .then((bitmap) => {
+      worker.postMessage(
+        { type: "frame", bitmap, ts: performance.now() },
+        [bitmap] // transfer ownership — zero-copy
+      );
+    })
+    .catch(() => {
+      workerBusy = false;
+    });
 }
 
-function detectHands() {
-  if (!handLandmarker || !video.videoWidth) return;
-  if (video.currentTime === lastVideoTime) return;
-  lastVideoTime = video.currentTime;
-  detectTs = Math.max(detectTs + 1, performance.now());
-
-  const res = handLandmarker.detectForVideo(video, detectTs);
+// The worker returns palm points in normalised camera coords. Map them to the
+// screen and assign to the mallets (leftmost → P1, rightmost → P2).
+function onHands(hands) {
+  if (!hands || hands.length === 0) return;
   const pts = [];
-  if (res && res.landmarks) {
-    for (const lm of res.landmarks) {
-      const p = palmPoint(lm);
-      if (p) pts.push(p);
-    }
+  for (const h of hands) {
+    const p = mapToScreen(h.x, h.y);
+    if (p) pts.push(p);
   }
   assignHands(pts);
 }
@@ -260,7 +282,7 @@ function loop(now) {
   const dt = lastTime ? Math.min(0.033, (now - lastTime) / 1000) : 0.016;
   lastTime = now;
 
-  if (useCamera) detectHands();
+  if (useCamera) sendFrame(now);
   update(dt);
   render();
   requestAnimationFrame(loop);
@@ -444,10 +466,90 @@ function resetMatch() {
 // ---------------------------------------------------------------------------
 // Rendering — the rink, mallets and puck
 // ---------------------------------------------------------------------------
+// The rink never changes between frames, so we render it once (per resize) to
+// an offscreen canvas and blit it each frame. This keeps the costly glow/shadow
+// strokes out of the 60 Hz render path.
+const rinkCanvas = document.createElement("canvas");
+const rinkCtx = rinkCanvas.getContext("2d");
+let puckSprite = null; // pre-rendered glowing puck
+let malletSprite = null; // pre-rendered glowing mallet (shared by both players)
+
+function buildRink() {
+  rinkCanvas.width = Math.round(W * dpr);
+  rinkCanvas.height = Math.round(H * dpr);
+  rinkCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  rinkCtx.clearRect(0, 0, W, H);
+  drawRink(rinkCtx);
+}
+
+// Pre-render the glowing puck + mallet once per resize so the expensive
+// shadowBlur is never touched in the 60 Hz loop — each frame just blits them.
+function makeSprite(radius, drawFn) {
+  const pad = 30; // room for the glow
+  const size = Math.ceil((radius + pad) * 2);
+  const cv = document.createElement("canvas");
+  cv.width = Math.ceil(size * dpr);
+  cv.height = Math.ceil(size * dpr);
+  const c = cv.getContext("2d");
+  c.setTransform(dpr, 0, 0, dpr, 0, 0);
+  c.translate(size / 2, size / 2);
+  drawFn(c);
+  return { canvas: cv, size };
+}
+
+function buildSprites() {
+  puckSprite = makeSprite(puck.r, (c) => {
+    c.beginPath();
+    c.arc(0, 0, puck.r, 0, Math.PI * 2);
+    c.fillStyle = "#fff";
+    c.shadowColor = "rgba(255,255,255,0.95)";
+    c.shadowBlur = 18;
+    c.fill();
+    c.shadowBlur = 0;
+    c.lineWidth = 2;
+    c.strokeStyle = "rgba(0,0,0,0.25)";
+    c.stroke();
+  });
+
+  const r = players[0].r;
+  malletSprite = makeSprite(r, (c) => {
+    c.beginPath();
+    c.arc(0, 0, r, 0, Math.PI * 2);
+    c.fillStyle = "rgba(255,255,255,0.06)";
+    c.fill();
+    c.beginPath();
+    c.arc(0, 0, r, 0, Math.PI * 2);
+    c.lineWidth = 5;
+    c.strokeStyle = "rgba(0,0,0,0.35)";
+    c.stroke();
+    c.lineWidth = 3;
+    c.strokeStyle = "#fff";
+    c.shadowColor = "rgba(255,255,255,0.8)";
+    c.shadowBlur = 12;
+    c.stroke();
+    c.shadowBlur = 0;
+    c.beginPath();
+    c.arc(0, 0, r * 0.5, 0, Math.PI * 2);
+    c.lineWidth = 2;
+    c.strokeStyle = "rgba(255,255,255,0.9)";
+    c.stroke();
+    c.beginPath();
+    c.arc(0, 0, 3, 0, Math.PI * 2);
+    c.fillStyle = "#fff";
+    c.fill();
+  });
+}
+
 function render() {
-  ctx.clearRect(0, 0, W, H);
+  // Clear + blit the pre-rendered rink in raw device pixels.
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
+  if (gameState !== "menu") ctx.drawImage(rinkCanvas, 0, 0);
+  ctx.restore();
   if (gameState === "menu") return;
-  drawRink();
+
+  // Only the moving pieces are drawn fresh each frame.
   drawTrail();
   drawPuck();
   drawPaddle(players[0]);
@@ -456,78 +558,78 @@ function render() {
 
 // Stroke the current path with a dark underlay so white lines read on any
 // background, then the bright white line (optionally glowing).
-function strokeWhite(w, glow) {
+function strokeWhite(c, w, glow) {
   // Dark underlay so white lines read on any background.
-  ctx.lineWidth = w + 4;
-  ctx.strokeStyle = "rgba(0,0,0,0.4)";
-  ctx.stroke();
+  c.lineWidth = w + 4;
+  c.strokeStyle = "rgba(0,0,0,0.4)";
+  c.stroke();
   // Bright white line, optionally glowing (double-stroked to bloom).
-  ctx.lineWidth = w;
-  ctx.strokeStyle = "rgba(255,255,255,0.98)";
+  c.lineWidth = w;
+  c.strokeStyle = "rgba(255,255,255,0.98)";
   if (glow) {
-    ctx.shadowColor = "rgba(255,255,255,0.95)";
-    ctx.shadowBlur = 16;
-    ctx.stroke();
+    c.shadowColor = "rgba(255,255,255,0.95)";
+    c.shadowBlur = 16;
+    c.stroke();
   }
-  ctx.stroke();
-  ctx.shadowBlur = 0;
+  c.stroke();
+  c.shadowBlur = 0;
 }
 
-function drawRink() {
+function drawRink(c) {
   const i = dim.inset;
 
   // Boundary
-  ctx.beginPath();
-  ctx.roundRect(i, i, W - 2 * i, H - 2 * i, Math.min(28, H * 0.03));
-  strokeWhite(4, true);
+  c.beginPath();
+  c.roundRect(i, i, W - 2 * i, H - 2 * i, Math.min(28, H * 0.03));
+  strokeWhite(c, 4, true);
 
   // Center line (dashed)
-  ctx.save();
-  ctx.setLineDash([14, 14]);
-  ctx.beginPath();
-  ctx.moveTo(W / 2, i);
-  ctx.lineTo(W / 2, H - i);
-  strokeWhite(4, true);
-  ctx.restore();
+  c.save();
+  c.setLineDash([14, 14]);
+  c.beginPath();
+  c.moveTo(W / 2, i);
+  c.lineTo(W / 2, H - i);
+  strokeWhite(c, 4, true);
+  c.restore();
 
   // Center circle + face-off dot
-  ctx.beginPath();
-  ctx.arc(W / 2, H / 2, dim.centerR, 0, Math.PI * 2);
-  strokeWhite(4, true);
-  ctx.beginPath();
-  ctx.arc(W / 2, H / 2, 6, 0, Math.PI * 2);
-  ctx.fillStyle = "#fff";
-  ctx.shadowColor = "rgba(255,255,255,0.95)";
-  ctx.shadowBlur = 14;
-  ctx.fill();
-  ctx.shadowBlur = 0;
+  c.beginPath();
+  c.arc(W / 2, H / 2, dim.centerR, 0, Math.PI * 2);
+  strokeWhite(c, 4, true);
+  c.beginPath();
+  c.arc(W / 2, H / 2, 6, 0, Math.PI * 2);
+  c.fillStyle = "#fff";
+  c.shadowColor = "rgba(255,255,255,0.95)";
+  c.shadowBlur = 14;
+  c.fill();
+  c.shadowBlur = 0;
 
-  drawGoal(0);
-  drawGoal(1);
+  drawGoal(c, 0);
+  drawGoal(c, 1);
 }
 
-function drawGoal(side) {
+function drawGoal(c, side) {
   const i = dim.inset;
   const x = side === 0 ? i : W - i;
   const dir = side === 0 ? 1 : -1;
 
   // Crease (half circle bulging into the field)
-  ctx.beginPath();
-  ctx.arc(
+  c.beginPath();
+  c.arc(
     x,
     H / 2,
     dim.creaseR,
     side === 0 ? -Math.PI / 2 : Math.PI / 2,
     side === 0 ? Math.PI / 2 : (3 * Math.PI) / 2
   );
-  strokeWhite(4, true);
+  strokeWhite(c, 4, true);
 
   // Goal posts — short bright marks at the mouth ends
   for (const gy of [dim.goalTop, dim.goalBot]) {
-    ctx.beginPath();
-    ctx.moveTo(x, gy);
-    ctx.lineTo(x + dir * Math.min(30, W * 0.024), gy);
-    strokeWhite(8, true);
+    c.beginPath();
+    c.moveTo(x, gy);
+    c.lineTo(x + dir * Math.min(30, W * 0.024), gy);
+    strokeWhite(c, 8, true);
   }
 }
 
@@ -750,7 +852,7 @@ async function start() {
     statusEl.textContent = "Requesting camera…";
     await initCamera();
     statusEl.textContent = "Loading hand tracking…";
-    await initHandLandmarker();
+    await initWorker();
     useCamera = true;
     setNotice("R reset · Space pause · B background · P1 left · P2 right");
   } catch (err) {
